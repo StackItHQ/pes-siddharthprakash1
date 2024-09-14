@@ -38,29 +38,55 @@ def get_db_data(cursor):
     cursor.execute("SELECT column1, column2, column3 FROM data_table")
     # Convert None to empty string for comparison with sheet data
     return [('column1', 'column2', 'column3')] + [tuple('' if x is None else x for x in row) for row in cursor.fetchall()]
+
 def update_sheet(sheet, data):
     if data:
-        sheet.update('A1', data)
+        # Update only the necessary rows in Google Sheets
+        # Assuming column1 is unique and you need to match it
+        for i, row in enumerate(data[1:], start=2):  # Skip header row
+            sheet.update(f'A{i}', [row])
     else:
         sheet.update('A1', [['column1', 'column2', 'column3']])  # Keep header even if data is empty
+ 
+def get_updated_db_data(cursor, last_sync_time):
+    query = "SELECT column1, column2, column3, last_updated FROM data_table WHERE last_updated > %s"
+    cursor.execute(query, (last_sync_time,))
+    return [('column1', 'column2', 'column3')] + [tuple('' if x is None else x for x in row[:3]) for row in cursor.fetchall()]
 
-def update_db(cursor, data):
-    cursor.execute("DELETE FROM data_table")  # Clear existing data
-    for row in data[1:]:  # Skip header row
-        # Replace empty strings with None for SQL NULL
-        row = [None if cell.strip() == '' else cell for cell in row]
-        cursor.execute("""
-            INSERT INTO data_table (column1, column2, column3)
-            VALUES (%s, %s, %s)
-        """, row)
+def update_db(cursor, data, connection, max_retries=5):
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            cursor.execute("DELETE FROM data_table")  # Clear existing data
+            for row in data[1:]:  # Skip header row
+                # Replace empty strings with None for SQL NULL
+                row = [None if cell.strip() == '' else cell for cell in row]
+                cursor.execute("""
+                    INSERT INTO data_table (column1, column2, column3)
+                    VALUES (%s, %s, %s)
+                """, row)
+            connection.commit()  # Commit transaction after successful execution
+            break  # If successful, exit the loop
+        except mysql.connector.Error as e:
+            if e.errno == 1213:  # Deadlock error
+                print(f"Deadlock detected. Retrying... ({retry_count+1}/{max_retries})")
+                retry_count += 1
+                time.sleep(1)  # Small delay before retrying
+            else:
+                raise e  # Raise any other errors
+
+from datetime import datetime
+
 def main():
     connection = None
     cursor = None
+    last_sync_time = datetime.min  # Initialize with an old date
+
     try:
         # Connect to MySQL
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor()
-        
+
         print("Successfully connected to MySQL database")
 
         # Open the specific sheet by ID and name
@@ -71,25 +97,30 @@ def main():
         print(f"Successfully opened worksheet: {sheet.title}")
 
         while True:
-            # Check for changes in Google Sheet
+            # Get current data from Google Sheets and updated data from Database
             sheet_data = get_sheet_data(sheet)
-            db_data = get_db_data(cursor)
+            updated_db_data = get_updated_db_data(cursor, last_sync_time)
 
+            # Sync from Google Sheets to Database if needed
+            db_data = get_db_data(cursor)
             if sheet_data != db_data:
-                print("Updating database...")
-                update_db(cursor, sheet_data)
+                print("Updating database from Google Sheets...")
+                update_db(cursor, sheet_data, connection)
                 connection.commit()
-                print("Database updated. Current contents:")
+                print("Database updated from Google Sheets. Current contents:")
                 print(get_db_data(cursor))
 
-            # Fetch updated db_data
-            db_data = get_db_data(cursor)
-            if sheet_data != db_data:
-                print("Updating Google Sheet...")
-                update_sheet(sheet, db_data)
-                print("Google Sheet updated.")
+            # Sync from Database to Google Sheets
+            if updated_db_data:  # Only update Sheets if there are new changes in DB
+                print("Updating Google Sheets from Database...")
+                update_sheet(sheet, updated_db_data)
+                print("Google Sheets updated from Database.")
 
-            time.sleep(10)  # Wait for 10 seconds before next check
+            # Update last_sync_time after sync is done
+            last_sync_time = datetime.now()
+
+            # Wait for 10 seconds before next check
+            time.sleep(10)
 
     except gspread.exceptions.SpreadsheetNotFound:
         print(f"Error: Could not find a spreadsheet with ID {SHEET_ID}")
