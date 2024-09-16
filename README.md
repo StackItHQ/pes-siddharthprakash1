@@ -59,4 +59,6 @@ We're available at techhiring@superjoin.ai for all queries.
 All the best ✨.
 
 ## Developer's Section
-*Add your video here, and your approach to the problem (optional). Leave some comments for us here if you want, we will be reading this :)*
+I have added the vid in .mp4 format in the files which I uploaded I have also added comments wherever I could 
+
+
