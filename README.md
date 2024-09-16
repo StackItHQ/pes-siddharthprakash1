@@ -59,7 +59,7 @@ We're available at techhiring@superjoin.ai for all queries.
 All the best ✨.
 
 ## Developer's Section
-[I have added the vid in .mp4 format in the files which I uploaded I have also added comments wherever I could ](https://drive.google.com/file/d/10UKLhbQwhT4L-5r3E6A3cxJx_oj3qznf/view?usp=sharing)
+[I have added the vid in this link click on it to see I have explained everythin in this its a bit long but I have explained everythin in detail its around 8min](https://drive.google.com/file/d/10UKLhbQwhT4L-5r3E6A3cxJx_oj3qznf/view?usp=sharing)
 
 
 
