@@ -1,13 +1,6 @@
-CREATE DATABASE IF NOT EXISTS superjoin_sync;
-
-USE superjoin_sync;
-
-DROP TABLE IF EXISTS data_table;
-
-CREATE TABLE data_table (
-    column1 VARCHAR(255) PRIMARY KEY,
-    column2 VARCHAR(255),
-    column3 VARCHAR(255)
+CREATE TABLE sync_table (
+    id INT PRIMARY KEY,
+    name VARCHAR(255),
+    value VARCHAR(255)
 );
-USE superjoin_sync;
-SELECT * FROM data_table;
+SELECT * FROM sync_table;

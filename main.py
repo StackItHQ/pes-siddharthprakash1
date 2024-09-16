@@ -1,14 +1,17 @@
 import os
 import time
+from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import mysql.connector
 from mysql.connector import Error
+from concurrent.futures import ThreadPoolExecutor
 
 # Google Sheets setup
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
 client = gspread.authorize(creds)
+sheet = client.open_by_key('1tv4ZIIvFcDGhtrLliZyT2ZvZG0F2pyRhqCS65aT-YXs').worksheet('Sheet1')
 
 # MySQL setup
 db_config = {
@@ -18,126 +21,128 @@ db_config = {
     'database': 'superjoin_sync'
 }
 
-SHEET_ID = '1tv4ZIIvFcDGhtrLliZyT2ZvZG0F2pyRhqCS65aT-YXs'
-SHEET_NAME = 'Sheet1'
+# Track last sync timestamps
+last_sync_google = None
+last_sync_mysql = None
 
-def get_sheet_data(sheet):
-    data = sheet.get_all_values()
-    # Remove empty rows and duplicates, keeping only the first occurrence
-    cleaned_data = []
-    seen = set()
-    for row in data:
-        if any(cell.strip() for cell in row):  # Check if row is not empty
-            row_tuple = tuple(row)
-            if row_tuple not in seen:
-                cleaned_data.append(row)
-                seen.add(row_tuple)
-    return cleaned_data
+# Polling interval (in seconds)
+POLL_INTERVAL = 5
 
-def get_db_data(cursor):
-    cursor.execute("SELECT column1, column2, column3 FROM data_table")
-    # Convert None to empty string for comparison with sheet data
-    return [('column1', 'column2', 'column3')] + [tuple('' if x is None else x for x in row) for row in cursor.fetchall()]
 
-def update_sheet(sheet, data):
-    if data:
-        # Update only the necessary rows in Google Sheets
-        # Assuming column1 is unique and you need to match it
-        for i, row in enumerate(data[1:], start=2):  # Skip header row
-            sheet.update(f'A{i}', [row])
-    else:
-        sheet.update('A1', [['column1', 'column2', 'column3']])  # Keep header even if data is empty
- 
-def get_updated_db_data(cursor, last_sync_time):
-    query = "SELECT column1, column2, column3, last_updated FROM data_table WHERE last_updated > %s"
-    cursor.execute(query, (last_sync_time,))
-    return [('column1', 'column2', 'column3')] + [tuple('' if x is None else x for x in row[:3]) for row in cursor.fetchall()]
-
-def update_db(cursor, data, connection, max_retries=5):
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            cursor.execute("DELETE FROM data_table")  # Clear existing data
-            for row in data[1:]:  # Skip header row
-                # Replace empty strings with None for SQL NULL
-                row = [None if cell.strip() == '' else cell for cell in row]
-                cursor.execute("""
-                    INSERT INTO data_table (column1, column2, column3)
-                    VALUES (%s, %s, %s)
-                """, row)
-            connection.commit()  # Commit transaction after successful execution
-            break  # If successful, exit the loop
-        except mysql.connector.Error as e:
-            if e.errno == 1213:  # Deadlock error
-                print(f"Deadlock detected. Retrying... ({retry_count+1}/{max_retries})")
-                retry_count += 1
-                time.sleep(1)  # Small delay before retrying
-            else:
-                raise e  # Raise any other errors
-
-from datetime import datetime
-
-def main():
-    connection = None
-    cursor = None
-    last_sync_time = datetime.min  # Initialize with an old date
-
+def get_mysql_connection():
+    """Establishes a connection to the MySQL database."""
     try:
-        # Connect to MySQL
         connection = mysql.connector.connect(**db_config)
+        if connection.is_connected():
+            print("MySQL: Connection established")
+            return connection
+    except Error as e:
+        print(f"Error while connecting to MySQL: {e}")
+    return None
+
+
+def fetch_google_sheet_data():
+    """Fetch all data from Google Sheets."""
+    print("Fetching data from Google Sheets...")
+    data = sheet.get_all_records()
+    print(f"Fetched {len(data)} rows from Google Sheets")
+    return data
+
+
+def fetch_mysql_data():
+    """Fetch all data from MySQL."""
+    print("Fetching data from MySQL...")
+    connection = get_mysql_connection()
+    if connection:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM sync_table")  # Assuming your table is named 'sync_table'
+        data = cursor.fetchall()
+        connection.close()
+        print(f"Fetched {len(data)} rows from MySQL")
+        return data
+    return []
+
+
+def sync_google_to_mysql():
+    """Sync changes from Google Sheets to MySQL."""
+    global last_sync_google
+    print("Syncing Google Sheets data to MySQL...")
+    google_data = fetch_google_sheet_data()
+
+    connection = get_mysql_connection()
+    if connection:
         cursor = connection.cursor()
+        for row in google_data:
+            # Assuming each row has a unique 'id' field
+            id_ = row['id']
+            cursor.execute("SELECT * FROM sync_table WHERE id = %s", (id_,))
+            result = cursor.fetchone()
 
-        print("Successfully connected to MySQL database")
+            if result:  # Update if the row exists
+                print(f"Updating row in MySQL: ID = {id_}")
+                cursor.execute("""
+                    UPDATE sync_table SET name = %s, value = %s WHERE id = %s
+                """, (row['name'], row['value'], id_))
+            else:  # Insert new row
+                print(f"Inserting new row in MySQL: ID = {id_}")
+                cursor.execute("""
+                    INSERT INTO sync_table (id, name, value) VALUES (%s, %s, %s)
+                """, (id_, row['name'], row['value']))
+        connection.commit()
+        connection.close()
 
-        # Open the specific sheet by ID and name
-        spreadsheet = client.open_by_key(SHEET_ID)
-        print(f"Successfully opened spreadsheet: {spreadsheet.title}")
-        
-        sheet = spreadsheet.worksheet(SHEET_NAME)
-        print(f"Successfully opened worksheet: {sheet.title}")
+        print("Google Sheets to MySQL sync completed.")
+        last_sync_google = datetime.now()
 
+
+def sync_mysql_to_google():
+    """Sync changes from MySQL to Google Sheets."""
+    global last_sync_mysql
+    print("Syncing MySQL data to Google Sheets...")
+    mysql_data = fetch_mysql_data()
+
+    google_data = fetch_google_sheet_data()
+    google_ids = [row['id'] for row in google_data]
+
+    for row in mysql_data:
+        id_ = row['id']
+        cell = sheet.find(str(id_))
+
+        if cell:  # If the id is found in Google Sheets
+            print(f"Updating row in Google Sheets: ID = {id_}")
+            sheet.update_cell(cell.row, 2, row['name'])  # Assuming name is in column 2
+            sheet.update_cell(cell.row, 3, row['value'])  # Assuming value is in column 3
+        else:  # If id is not found, insert the row into Google Sheets
+            print(f"Inserting new row in Google Sheets: ID = {id_}")
+            new_row = [row['id'], row['name'], row['value']]
+            sheet.append_row(new_row)
+
+    print("MySQL to Google Sheets sync completed.")
+    last_sync_mysql = datetime.now()
+
+
+def main_sync_loop():
+    """Main loop that runs synchronization tasks continuously."""
+    print("Starting main sync loop...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
         while True:
-            # Get current data from Google Sheets and updated data from Database
-            sheet_data = get_sheet_data(sheet)
-            updated_db_data = get_updated_db_data(cursor, last_sync_time)
+            print("Starting sync cycle...")
 
-            # Sync from Google Sheets to Database if needed
-            db_data = get_db_data(cursor)
-            if sheet_data != db_data:
-                print("Updating database from Google Sheets...")
-                update_db(cursor, sheet_data, connection)
-                connection.commit()
-                print("Database updated from Google Sheets. Current contents:")
-                print(get_db_data(cursor))
+            # Run Google-to-MySQL sync
+            google_to_mysql = executor.submit(sync_google_to_mysql)
 
-            # Sync from Database to Google Sheets
-            if updated_db_data:  # Only update Sheets if there are new changes in DB
-                print("Updating Google Sheets from Database...")
-                update_sheet(sheet, updated_db_data)
-                print("Google Sheets updated from Database.")
+            # Run MySQL-to-Google sync
+            mysql_to_google = executor.submit(sync_mysql_to_google)
 
-            # Update last_sync_time after sync is done
-            last_sync_time = datetime.now()
+            # Wait for both tasks to complete
+            google_to_mysql.result()
+            mysql_to_google.result()
 
-            # Wait for 10 seconds before next check
-            time.sleep(10)
+            print("Sync cycle completed.")
+            print(f"Sleeping for {POLL_INTERVAL} seconds before next cycle...\n")
+            # Sleep before polling again
+            time.sleep(POLL_INTERVAL)
 
-    except gspread.exceptions.SpreadsheetNotFound:
-        print(f"Error: Could not find a spreadsheet with ID {SHEET_ID}")
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"Error: Could not find a worksheet named '{SHEET_NAME}' in the spreadsheet")
-    except gspread.exceptions.APIError as e:
-        print(f"Google Sheets API error: {e}")
-    except mysql.connector.Error as e:
-        print(f"MySQL error: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-    finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
-            print("MySQL connection closed")
 
 if __name__ == "__main__":
-    main()
+    main_sync_loop()
